@@ -1,51 +1,79 @@
 /**
- * OpenAI Adapter for Criteria
+ * OpenAI Adapter for Criteria (Protocol v2)
  *
- * This adapter enables using OpenAI's models
- * as agent backends in Criteria workflows.
+ * This adapter enables using OpenAI's models as agent backends in Criteria
+ * workflows. It supports multi-turn conversations, tool calling, and
+ * outcome finalization via the v2 SDK helper surface.
  *
- * Features:
- * - Multi-turn conversations
- * - Tool calling with submit_outcome for workflow integration
- * - Permission gating for sensitive operations
- * - Structured events for observability
- *
- * Environment Variables:
- * - OPENAI_API_KEY: Required. Your OpenAI API key.
- * - OPENAI_BASE_URL: Optional. Override the API base URL.
- * - OPENAI_MODEL: Optional. Default model (default: gpt-4o)
+ * Secrets (all flow via the secret channel; only OPENAI_API_KEY is required):
+ * - OPENAI_API_KEY    – Required. Your OpenAI API key.
+ * - OPENAI_BASE_URL   – Optional. Override the API base URL.
+ * - OPENAI_ORG_ID     – Optional. Organization ID.
+ * - OPENAI_PROJECT_ID – Optional. Project ID.
  *
  * Example workflow:
  * ```hcl
  * step "analyze" {
  *   adapter = "openai"
  *   input {
- *     prompt = "Analyze this codebase for security issues"
+ *     prompt    = "Analyze this codebase for security issues"
  *     max_turns = 10
  *   }
- *   outcome "clean" { transition_to = "deploy" }
+ *   outcome "clean"        { transition_to = "deploy" }
  *   outcome "issues_found" { transition_to = "review" }
- *   outcome "failure" { transition_to = "failed" }
+ *   outcome "failure"      { transition_to = "failed" }
  * }
  * ```
  */
 
-import { serve, type EventSender, type ExecuteRequest } from '@criteria/adapter-sdk';
-import OpenAI from 'openai';
+import { serve } from "@criteria/adapter-sdk";
+import OpenAI from "openai";
 
 // ============================================================================
-// Types
+// Constants
 // ============================================================================
 
-interface SessionState {
-  client: OpenAI;
-  model: string;
-  messages: OpenAI.Chat.ChatCompletionMessageParam[];
-  maxTurns: number;
-  activeAllowedOutcomes: Set<string>;
-  finalizedOutcome: string | null;
-  finalizedReason: string;
-  finalizeAttempts: number;
+const DEFAULT_MODEL = "gpt-4o";
+const DEFAULT_MAX_TURNS = 10;
+
+const SUBMIT_OUTCOME_TOOL_NAME = "submit_outcome";
+const SUBMIT_OUTCOME_DESCRIPTION = `Finalize the outcome for the current step. Call this exactly once with one of the allowed outcomes before ending the turn. The allowed outcomes are provided in the conversation context. Failure to call this tool with a valid outcome will fail the step.`;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function buildSystemPrompt(configSystemPrompt?: string): string {
+  return (
+    configSystemPrompt ??
+    "You are a helpful assistant integrated into a workflow system. When you complete your task, you MUST call the submit_outcome tool with the appropriate outcome to proceed."
+  );
+}
+
+function buildTools(): OpenAI.Chat.ChatCompletionTool[] {
+  return [
+    {
+      type: "function",
+      function: {
+        name: SUBMIT_OUTCOME_TOOL_NAME,
+        description: SUBMIT_OUTCOME_DESCRIPTION,
+        parameters: {
+          type: "object",
+          properties: {
+            outcome: {
+              type: "string",
+              description: "The outcome name to finalize. Must be one of the allowed outcomes.",
+            },
+            reason: {
+              type: "string",
+              description: "Optional reason for the outcome.",
+            },
+          },
+          required: ["outcome"],
+        },
+      },
+    },
+  ];
 }
 
 interface SubmitOutcomeArgs {
@@ -53,275 +81,19 @@ interface SubmitOutcomeArgs {
   reason?: string;
 }
 
-// ============================================================================
-// Constants
-// ============================================================================
-
-const PLUGIN_NAME = 'openai';
-const PLUGIN_VERSION = '0.1.0';
-
-const DEFAULT_MODEL = 'gpt-4o';
-const DEFAULT_MAX_TURNS = 10;
-
-const SUBMIT_OUTCOME_TOOL_NAME = 'submit_outcome';
-const SUBMIT_OUTCOME_DESCRIPTION = `Finalize the outcome for the current step. Call this exactly once with one of the allowed outcomes before ending the turn. The allowed outcomes are provided in the conversation context. Failure to call this tool with a valid outcome will fail the step.`;
-
-const VALID_REASONING_EFFORTS = new Set(['low', 'medium', 'high']);
-
-// ============================================================================
-// Sessions
-// ============================================================================
-
-const sessions = new Map<string, SessionState>();
-
-function getSession(sessionId: string): SessionState | undefined {
-  return sessions.get(sessionId);
-}
-
-function createSession(sessionId: string, config: Record<string, string>): SessionState {
-  const apiKey = config.api_key || process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error('OpenAI API key is required. Set OPENAI_API_KEY environment variable or config.api_key');
+function parseSubmitOutcomeArgs(raw: string): SubmitOutcomeArgs {
+  const parsed = JSON.parse(raw) as unknown;
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error("submit_outcome arguments must be an object");
   }
-  
-  const baseURL = config.base_url || process.env.OPENAI_BASE_URL;
-  const model = config.model || process.env.OPENAI_MODEL || DEFAULT_MODEL;
-  
-  const client = new OpenAI({
-    apiKey,
-    baseURL,
-  });
-  
-  const systemPrompt = config.system_prompt || `You are a helpful assistant integrated into a workflow system. When you complete your task, you MUST call the submit_outcome tool with the appropriate outcome to proceed.`;
-  
-  const state: SessionState = {
-    client,
-    model,
-    messages: [{ role: 'system', content: systemPrompt }],
-    maxTurns: parseInt(config.max_turns, 10) || DEFAULT_MAX_TURNS,
-    activeAllowedOutcomes: new Set(),
-    finalizedOutcome: null,
-    finalizedReason: '',
-    finalizeAttempts: 0,
-  };
-  
-  sessions.set(sessionId, state);
-  return state;
-}
-
-function closeSession(sessionId: string): void {
-  sessions.delete(sessionId);
-}
-
-// ============================================================================
-// Tool Handlers
-// ============================================================================
-
-function handleSubmitOutcome(state: SessionState, args: SubmitOutcomeArgs): { success: boolean; message: string } {
-  state.finalizeAttempts++;
-  
-  const outcome = args.outcome?.trim();
-  const reason = args.reason?.trim() || '';
-  
-  // Check for duplicate
-  if (state.finalizedOutcome !== null) {
-    return {
-      success: false,
-      message: `Outcome already finalized as "${state.finalizedOutcome}". Do not call submit_outcome again.`,
-    };
+  const args = parsed as Record<string, unknown>;
+  if (typeof args.outcome !== "string") {
+    throw new Error('submit_outcome argument "outcome" is required and must be a string');
   }
-  
-  // Check for missing outcome
-  if (!outcome) {
-    return {
-      success: false,
-      message: 'Outcome is required. Please provide a valid outcome name.',
-    };
-  }
-  
-  // Check for valid outcome
-  if (!state.activeAllowedOutcomes.has(outcome)) {
-    const allowed = Array.from(state.activeAllowedOutcomes).join(', ');
-    if (state.activeAllowedOutcomes.size === 0) {
-      return {
-        success: false,
-        message: 'No outcomes are declared for this step.',
-      };
-    }
-    return {
-      success: false,
-      message: `Outcome "${outcome}" is not in the allowed set. Choose one of: ${allowed}`,
-    };
-  }
-  
-  // Success
-  state.finalizedOutcome = outcome;
-  state.finalizedReason = reason;
-  
   return {
-    success: true,
-    message: `Outcome "${outcome}" recorded successfully.`,
+    outcome: args.outcome,
+    reason: typeof args.reason === "string" ? args.reason : undefined,
   };
-}
-
-// ============================================================================
-// Execute Logic
-// ============================================================================
-
-async function executeTurn(
-  state: SessionState,
-  req: ExecuteRequest,
-  sender: EventSender
-): Promise<void> {
-  const prompt = req.config.prompt;
-  if (!prompt) {
-    throw new Error('config.prompt is required');
-  }
-  
-  // Reset per-execution state
-  state.finalizedOutcome = null;
-  state.finalizedReason = '';
-  state.finalizeAttempts = 0;
-  state.activeAllowedOutcomes = new Set(req.allowedOutcomes);
-  
-  // Add allowed outcomes preamble
-  if (req.allowedOutcomes.length > 0) {
-    const outcomeList = req.allowedOutcomes.join(', ');
-    const preamble = `You must finalize the outcome for this step by calling the submit_outcome tool exactly once before ending the turn. The allowed outcomes are: ${outcomeList}. If you do not call the tool with a valid outcome, the step will fail.\n\n`;
-    state.messages.push({ role: 'user', content: preamble + prompt });
-  } else {
-    state.messages.push({ role: 'user', content: prompt });
-  }
-  
-  await sender.log('stdout', `[openai] Starting conversation with model ${state.model}\n`);
-  
-  let turnCount = 0;
-  const maxTurns = parseInt(req.config.max_turns, 10) || state.maxTurns;
-  
-  while (turnCount < maxTurns) {
-    turnCount++;
-    
-    await sender.log('stdout', `[openai] Turn ${turnCount}/${maxTurns}\n`);
-    
-    // Define tools
-    const tools: OpenAI.Chat.ChatCompletionTool[] = [
-      {
-        type: 'function',
-        function: {
-          name: SUBMIT_OUTCOME_TOOL_NAME,
-          description: SUBMIT_OUTCOME_DESCRIPTION,
-          parameters: {
-            type: 'object',
-            properties: {
-              outcome: {
-                type: 'string',
-                description: 'The outcome name to finalize. Must be one of the allowed outcomes.',
-              },
-              reason: {
-                type: 'string',
-                description: 'Optional reason for the outcome.',
-              },
-            },
-            required: ['outcome'],
-          },
-        },
-      },
-    ];
-    
-    // Call OpenAI API
-    const response = await state.client.chat.completions.create({
-      model: state.model,
-      messages: state.messages,
-      tools,
-      tool_choice: 'auto',
-    });
-    
-    const message = response.choices[0]?.message;
-    if (!message) {
-      throw new Error('No response from OpenAI API');
-    }
-    
-    // Add assistant message to history
-    state.messages.push(message);
-    
-    // Stream content
-    if (message.content) {
-      await sender.log('stdout', message.content);
-      await sender.adapterEvent({
-        type: 'agent.message',
-        content: message.content,
-        turn: turnCount,
-      });
-    }
-    
-    // Handle tool calls
-    if (message.tool_calls?.length > 0) {
-      for (const toolCall of message.tool_calls) {
-        if (toolCall.function.name === SUBMIT_OUTCOME_TOOL_NAME) {
-          let args: SubmitOutcomeArgs;
-          try {
-            args = JSON.parse(toolCall.function.arguments);
-          } catch (e) {
-            await sender.adapterEvent({
-              type: 'tool.error',
-              error: 'Failed to parse submit_outcome arguments',
-            });
-            continue;
-          }
-          
-          const result = handleSubmitOutcome(state, args);
-          
-          await sender.adapterEvent({
-            type: 'outcome.finalized',
-            outcome: args.outcome,
-            reason: args.reason,
-            success: result.success,
-          });
-          
-          if (result.success) {
-            // Return the result
-            await sender.result(state.finalizedOutcome!, {});
-            return;
-          }
-          
-          // Add error to messages for retry
-          state.messages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            content: result.message,
-          });
-        }
-      }
-    }
-    
-    // Check if conversation should end
-    if (!message.tool_calls?.length) {
-      // No tool calls, model ended turn without finalizing
-      break;
-    }
-  }
-  
-  // Max turns reached or conversation ended without outcome
-  if (turnCount >= maxTurns) {
-    await sender.adapterEvent({
-      type: 'limit.reached',
-      max_turns: maxTurns,
-    });
-    
-    // Check if needs_review is allowed
-    if (state.activeAllowedOutcomes.has('needs_review')) {
-      await sender.result('needs_review', { reason: 'Max turns reached' });
-    } else {
-      await sender.result('failure', { reason: 'Max turns reached without outcome' });
-    }
-  } else {
-    await sender.adapterEvent({
-      type: 'outcome.failure',
-      reason: 'missing finalize',
-      attempts: state.finalizeAttempts,
-    });
-    await sender.result('failure', { reason: 'Conversation ended without submit_outcome' });
-  }
 }
 
 // ============================================================================
@@ -329,48 +101,297 @@ async function executeTurn(
 // ============================================================================
 
 serve({
-  name: PLUGIN_NAME,
-  version: PLUGIN_VERSION,
-  capabilities: ['multi_turn', 'structured_events', 'tool_calling'],
-  
-  configSchema: {
+  name: "openai",
+  version: "2.0.0",
+  description: "OpenAI adapter for Criteria workflows.",
+  source_url: "https://github.com/criteria-adapters/openai",
+  capabilities: ["multi_turn", "structured_events", "tool_calling"],
+  platforms: ["linux/amd64", "linux/arm64", "darwin/arm64"],
+
+  config_schema: {
     fields: {
-      api_key: { type: 'string', required: false, doc: 'OpenAI API key. Falls back to OPENAI_API_KEY env var.' },
-      base_url: { type: 'string', required: false, doc: 'OpenAI API base URL. Falls back to OPENAI_BASE_URL env var.' },
-      model: { type: 'string', required: false, doc: `Model to use (default: ${DEFAULT_MODEL})` },
-      max_turns: { type: 'number', required: false, doc: 'Maximum turns per Execute call' },
-      system_prompt: { type: 'string', required: false, doc: 'System prompt for the conversation' },
+      model: {
+        type: "string",
+        required: false,
+        description: `Model to use (default: ${DEFAULT_MODEL})`,
+      },
+      max_turns: {
+        type: "number",
+        required: false,
+        description: "Maximum turns per Execute call",
+      },
+      system_prompt: {
+        type: "string",
+        required: false,
+        description: "System prompt for the conversation",
+      },
     },
   },
-  
-  inputSchema: {
+
+  input_schema: {
     fields: {
-      prompt: { type: 'string', required: true, doc: 'The prompt to send to the model' },
-      max_turns: { type: 'number', required: false, doc: 'Per-step override for max turns' },
-      model: { type: 'string', required: false, doc: 'Per-step override for model' },
+      prompt: {
+        type: "string",
+        required: true,
+        description: "The prompt to send to the model",
+      },
+      max_turns: {
+        type: "number",
+        required: false,
+        description: "Per-step override for max turns",
+      },
+      model: {
+        type: "string",
+        required: false,
+        description: "Per-step override for model",
+      },
     },
   },
-  
-  async onOpenSession(req) {
-    createSession(req.sessionId, req.config);
+
+  output_schema: {
+    fields: {
+      reason: {
+        type: "string",
+        required: false,
+        description: "Reason for the chosen outcome",
+      },
+    },
   },
-  
-  async execute(req, sender) {
-    const state = getSession(req.sessionId);
-    if (!state) {
-      throw new Error(`Unknown session: ${req.sessionId}`);
+
+  secrets: [
+    {
+      name: "OPENAI_API_KEY",
+      required: true,
+      description: "OpenAI API key",
+    },
+    {
+      name: "OPENAI_BASE_URL",
+      required: false,
+      description: "Override the OpenAI API base URL",
+    },
+    {
+      name: "OPENAI_ORG_ID",
+      required: false,
+      description: "OpenAI organization ID",
+    },
+    {
+      name: "OPENAI_PROJECT_ID",
+      required: false,
+      description: "OpenAI project ID",
+    },
+  ],
+
+  permissions: [],
+
+  async openSession(req, helpers) {
+    const apiKey = await helpers.secrets.get("OPENAI_API_KEY");
+    if (!apiKey) {
+      throw new Error("OpenAI API key is required. Set the OPENAI_API_KEY secret.");
     }
-    
-    await executeTurn(state, req, sender);
+
+    const baseURL = (await helpers.secrets.get("OPENAI_BASE_URL")) ?? undefined;
+    const organization = (await helpers.secrets.get("OPENAI_ORG_ID")) ?? undefined;
+    const project = (await helpers.secrets.get("OPENAI_PROJECT_ID")) ?? undefined;
+
+    const client = new OpenAI({
+      apiKey,
+      baseURL,
+      organization,
+      project,
+    });
+
+    const model = req.config.model || DEFAULT_MODEL;
+    const maxTurns = parseInt(req.config.max_turns, 10) || DEFAULT_MAX_TURNS;
+    const systemPrompt = buildSystemPrompt(req.config.system_prompt);
+
+    helpers.session.set("client", client);
+    helpers.session.set("model", model);
+    helpers.session.set("maxTurns", maxTurns);
+    helpers.session.set("systemPrompt", systemPrompt);
+    helpers.session.set("messages", [] as OpenAI.Chat.ChatCompletionMessageParam[]);
+    helpers.session.set("finalizeAttempts", 0);
+
+    await helpers.log.stdout(`[openai] Session opened (model=${model})\n`);
   },
-  
-  async onPermit(req) {
-    // Permission handling - could integrate with OpenAI's permission system
-    // For now, just log
-    console.error(`Permission ${req.permissionId}: ${req.allow ? 'allowed' : 'denied'}`);
+
+  async execute(req, helpers) {
+    const prompt = req.input.prompt;
+    if (!prompt) {
+      throw new Error("input.prompt is required");
+    }
+
+    const client = helpers.session.get<OpenAI>("client");
+    const model = req.input.model ?? helpers.session.get<string>("model") ?? DEFAULT_MODEL;
+    const maxTurns = parseInt(req.input.max_turns, 10) || helpers.session.get<number>("maxTurns") || DEFAULT_MAX_TURNS;
+    const systemPrompt = helpers.session.get<string>("systemPrompt") ?? buildSystemPrompt();
+
+    // Reset per-execution state
+    helpers.session.set("finalizeAttempts", 0);
+    let messages = helpers.session.get<OpenAI.Chat.ChatCompletionMessageParam[]>("messages") ?? [];
+
+    // Inject system prompt at the start if not already present
+    if (messages.length === 0 || messages[0]?.role !== "system") {
+      messages = [{ role: "system", content: systemPrompt }, ...messages];
+    }
+
+    // Add allowed-outcomes preamble to the prompt
+    const allowedOutcomes = req.allowed_outcomes ?? [];
+    if (allowedOutcomes.length > 0) {
+      const outcomeList = allowedOutcomes.join(", ");
+      const preamble = `You must finalize the outcome for this step by calling the submit_outcome tool exactly once before ending the turn. The allowed outcomes are: ${outcomeList}. If you do not call the tool with a valid outcome, the step will fail.\n\n`;
+      messages.push({ role: "user", content: preamble + prompt });
+    } else {
+      messages.push({ role: "user", content: prompt });
+    }
+
+    await helpers.log.stdout(`[openai] Starting conversation with model ${model}\n`);
+
+    const tools = buildTools();
+    let turnCount = 0;
+
+    while (turnCount < maxTurns) {
+      turnCount++;
+      await helpers.log.stdout(`[openai] Turn ${turnCount}/${maxTurns}\n`);
+
+      const response = await client.chat.completions.create({
+        model,
+        messages,
+        tools,
+        tool_choice: "auto",
+      });
+
+      const message = response.choices[0]?.message;
+      if (!message) {
+        throw new Error("No response from OpenAI API");
+      }
+
+      // Append assistant message to history
+      messages.push(message);
+
+      // Stream content
+      if (message.content) {
+        await helpers.log.stdout(message.content);
+        await helpers.log.adapterEvent("agent.message", {
+          content: message.content,
+          turn: turnCount,
+        });
+      }
+
+      // Handle tool calls
+      if (message.tool_calls && message.tool_calls.length > 0) {
+        for (const toolCall of message.tool_calls) {
+          if (toolCall.function.name === SUBMIT_OUTCOME_TOOL_NAME) {
+            let args: SubmitOutcomeArgs;
+            try {
+              args = parseSubmitOutcomeArgs(toolCall.function.arguments);
+            } catch (e) {
+              await helpers.log.adapterEvent("tool.error", {
+                error: "Failed to parse submit_outcome arguments",
+                detail: String(e),
+              });
+              // Push tool error back into conversation
+              messages.push({
+                role: "tool",
+                tool_call_id: toolCall.id,
+                content: `Error: Failed to parse submit_outcome arguments. ${String(e)}`,
+              });
+              continue;
+            }
+
+            const outcome = args.outcome?.trim();
+            const reason = args.reason?.trim() ?? "";
+
+            // Validate outcome via helpers.outcomes
+            const validation = await helpers.outcomes.validate(outcome);
+            if (!validation.valid) {
+              const errorMsg = validation.error ?? `Outcome "${outcome}" is not allowed.`;
+              await helpers.log.adapterEvent("outcome.finalized", {
+                outcome,
+                reason,
+                success: false,
+                error: errorMsg,
+              });
+              messages.push({
+                role: "tool",
+                tool_call_id: toolCall.id,
+                content: errorMsg,
+              });
+              continue;
+            }
+
+            // Success — finalize
+            await helpers.log.adapterEvent("outcome.finalized", {
+              outcome,
+              reason,
+              success: true,
+            });
+
+            await helpers.outcomes.finalize(outcome, { reason });
+            helpers.session.set("messages", messages);
+            return;
+          }
+        }
+      }
+
+      // No tool calls — model ended turn without finalizing
+      if (!message.tool_calls || message.tool_calls.length === 0) {
+        break;
+      }
+    }
+
+    // Max turns reached or conversation ended without outcome
+    if (turnCount >= maxTurns) {
+      await helpers.log.adapterEvent("limit.reached", { max_turns: maxTurns });
+    } else {
+      await helpers.log.adapterEvent("outcome.failure", {
+        reason: "missing finalize",
+        attempts: helpers.session.get<number>("finalizeAttempts") ?? 0,
+      });
+    }
+
+    // Fallback outcome selection
+    const fallback = allowedOutcomes.includes("needs_review")
+      ? "needs_review"
+      : "failure";
+    await helpers.outcomes.finalize(fallback, {
+      reason: turnCount >= maxTurns ? "Max turns reached" : "Conversation ended without submit_outcome",
+    });
+
+    helpers.session.set("messages", messages);
   },
-  
-  async onCloseSession(req) {
-    closeSession(req.sessionId);
+
+  async snapshot(sessionId, helpers) {
+    const messages = helpers.session.get<OpenAI.Chat.ChatCompletionMessageParam[]>("messages") ?? [];
+    const state = {
+      messages,
+      model: helpers.session.get<string>("model"),
+      maxTurns: helpers.session.get<number>("maxTurns"),
+      systemPrompt: helpers.session.get<string>("systemPrompt"),
+      finalizeAttempts: helpers.session.get<number>("finalizeAttempts"),
+    };
+    return {
+      state: new TextEncoder().encode(JSON.stringify(state)),
+      schema_version: 1,
+    };
+  },
+
+  async restore(sessionId, blob, helpers) {
+    const state = JSON.parse(new TextDecoder().decode(blob.state)) as {
+      messages: OpenAI.Chat.ChatCompletionMessageParam[];
+      model: string;
+      maxTurns: number;
+      systemPrompt: string;
+      finalizeAttempts: number;
+    };
+
+    helpers.session.set("messages", state.messages);
+    helpers.session.set("model", state.model);
+    helpers.session.set("maxTurns", state.maxTurns);
+    helpers.session.set("systemPrompt", state.systemPrompt);
+    helpers.session.set("finalizeAttempts", state.finalizeAttempts);
+  },
+
+  async closeSession(req, helpers) {
+    await helpers.log.stdout(`[openai] Session closed\n`);
   },
 });

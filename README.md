@@ -1,6 +1,6 @@
-# OpenAI Adapter Example
+# OpenAI Adapter
 
-This example demonstrates using OpenAI's models as agent backends in Criteria workflows.
+This adapter enables using OpenAI's models as agent backends in Criteria workflows (protocol v2).
 
 ## Features
 
@@ -9,29 +9,33 @@ This example demonstrates using OpenAI's models as agent backends in Criteria wo
 - Support for different models (gpt-4o, gpt-4-turbo, etc.)
 - Configurable max turns per step
 - Structured events for observability
+- Snapshot / restore for resumable sessions
+- Secret-channel-only API key handling (no env-var leakage)
 
 ## Setup
 
 1. **Install dependencies:**
    ```bash
-   cd examples/openai
-   npm install
+   bun install
    ```
 
-2. **Set your OpenAI API key:**
+2. **Configure secrets via the Criteria host secret provider** (e.g. `secrets.provider = "env"`):
    ```bash
    export OPENAI_API_KEY="sk-..."
+   export OPENAI_BASE_URL="https://api.openai.com/v1"   # optional
+   export OPENAI_ORG_ID="org-..."                        # optional
+   export OPENAI_PROJECT_ID="proj-..."                 # optional
    ```
 
 3. **Build the adapter:**
    ```bash
-   npm run build
+   bun run build
    ```
 
 4. **Install to Criteria plugins directory:**
    ```bash
    mkdir -p ~/.criteria/plugins
-   cp criteria-adapter-openai ~/.criteria/plugins/
+   cp out/adapter ~/.criteria/plugins/criteria-adapter-openai
    chmod +x ~/.criteria/plugins/criteria-adapter-openai
    ```
 
@@ -40,24 +44,30 @@ This example demonstrates using OpenAI's models as agent backends in Criteria wo
 Create a workflow file:
 
 ```hcl
-step "analyze" {
-  adapter = "openai"
+workflow "code-review" {
+  version       = "0.1"
+  initial_state = "analyze"
+  target_state  = "done"
+}
 
-  agent {
-    config {
-      model = "gpt-4o"
-      max_turns = 10
-      system_prompt = "You are a code reviewer."
-    }
+adapter "openai" "default" {
+  config {
+   model         = "gpt-4o"
+   max_turns     = 10
+   system_prompt = "You are a code reviewer."
   }
+}
+
+step "analyze" {
+  target = adapter.openai.default
 
   input {
-    prompt = "Review this code for bugs: $(file src/main.ts)"
+   prompt = "Review this code for bugs: $(file src/main.ts)"
   }
 
-  outcome "clean" { transition_to = "deploy" }
-  outcome "issues_found" { transition_to = "fix" }
-  outcome "failure" { transition_to = "failed" }
+  outcome "clean"        { next = state.deploy }
+  outcome "issues_found" { next = state.fix }
+  outcome "failure"      { next = state.failed }
 }
 ```
 
@@ -68,12 +78,10 @@ criteria apply workflow.hcl
 
 ## Configuration
 
-### Agent-level config (set once per session)
+### Adapter config (set once per adapter block)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `api_key` | string | No | `OPENAI_API_KEY` env | OpenAI API key |
-| `base_url` | string | No | - | Custom API base URL |
 | `model` | string | No | `gpt-4o` | Model to use |
 | `max_turns` | number | No | `10` | Default max turns per step |
 | `system_prompt` | string | No | - | System prompt for the session |
@@ -86,20 +94,39 @@ criteria apply workflow.hcl
 | `max_turns` | number | No | Per-step override for max turns |
 | `model` | string | No | Per-step override for model |
 
+### Secrets
+
+| Name | Required | Description |
+|------|----------|-------------|
+| `OPENAI_API_KEY` | **Yes** | OpenAI API key |
+| `OPENAI_BASE_URL` | No | Override the OpenAI API base URL |
+| `OPENAI_ORG_ID` | No | OpenAI organization ID |
+| `OPENAI_PROJECT_ID` | No | OpenAI project ID |
+
 ## How It Works
 
 The adapter implements a multi-turn conversation loop:
 
-1. **Session Open**: Creates an OpenAI client and stores conversation history
+1. **Session Open**: Creates an OpenAI client using secrets from the host, stores conversation history in `helpers.session`
 2. **Execute**: Sends the prompt to OpenAI with a `submit_outcome` tool
 3. **Tool Calling**: The model can call `submit_outcome(outcome, reason)` to finalize
-4. **Outcome Validation**: The adapter validates the outcome against allowed outcomes
-5. **Result**: Returns the outcome to Criteria for workflow transition
+4. **Outcome Validation**: The adapter validates the outcome via `helpers.outcomes.validate()` against allowed outcomes
+5. **Result**: Returns the outcome to Criteria for workflow transition via `helpers.outcomes.finalize()`
+
+### Shelling out safely
+
+If the adapter ever shells out to the official `openai` CLI, use `helpers.secrets.spawnEnv(...)` to build a redacted environment map:
+
+```typescript
+const env = await helpers.secrets.spawnEnv(["OPENAI_API_KEY"]);
+spawn("openai", [...], { env });
+```
 
 ## Development
 
 To modify the adapter:
 
 1. Edit `index.ts`
-2. Rebuild: `npm run build`
-3. Test with `criteria apply`
+2. Rebuild: `bun run build`
+3. Run tests: `bun test`
+4. Test with `criteria apply`

@@ -6,13 +6,12 @@
  */
 
 workflow "openai" {
-  version = "1.0"
+  version       = "1.0"
   initial_state = "openai"
-  target_state = "done"
+  target_state  = "done"
+}
 
-agent "openai" {
-  adapter = "openai"
-
+adapter "openai" "local" {
   config {
     base_url = "http://localhost:11434/v1"
     model    = "kimi-k2.6:cloud"
@@ -20,15 +19,21 @@ agent "openai" {
 }
 
 step "openai" {
-  agent = "openai"
+  target = adapter.openai.local
 
   input {
     prompt = "Explain what this workflow does in one sentence."
   }
 
-  outcome "success" { transition_to = "done" }
-  outcome "failure" { transition_to = "failed" }
+  outcome "success" { next = state.done }
+  outcome "failure" { next = state.failed }
 }
 
+state "done" {
+  terminal = true
+}
 
+state "failed" {
+  terminal = true
+  success  = false
 }
