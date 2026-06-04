@@ -100,7 +100,7 @@ function parseSubmitOutcomeArgs(raw: string): SubmitOutcomeArgs {
 // Main
 // ============================================================================
 
-serve({
+export const adapterConfig = {
   name: "openai",
   version: "2.0.0",
   description: "OpenAI adapter for Criteria workflows.",
@@ -394,4 +394,10 @@ serve({
   async closeSession(req, helpers) {
     await helpers.log.stdout(`[openai] Session closed\n`);
   },
-});
+};
+
+export default adapterConfig;
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  serve(adapterConfig);
+}

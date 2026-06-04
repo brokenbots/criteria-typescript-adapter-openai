@@ -1,37 +1,6 @@
 import { TestHost } from "@criteria/adapter-sdk/testing";
 import { describe, it, expect, beforeAll, afterAll, afterEach } from "bun:test";
-
-const isDarwin = process.platform === "darwin";
-const isLinux = process.platform === "linux";
-const isArm64 = process.arch === "arm64";
-const isX64 = process.arch === "x64";
-
-function getBinaryPath(): string {
-  if (isDarwin && isArm64) return "./out/adapter-darwin-arm64";
-  if (isLinux && isX64) return "./out/adapter-linux-amd64";
-  if (isLinux && isArm64) return "./out/adapter-linux-arm64";
-  throw new Error(`Unsupported platform/arch: ${process.platform}/${process.arch}`);
-}
-
-const BINARY = getBinaryPath();
-
-// Monkey-patch TestHost.execute to add an error handler on the Log stream,
-// preventing unhandled gRPC connection-drop noise during binary cleanup.
-const _origExecute = (TestHost.prototype as any).execute;
-(TestHost.prototype as any).execute = async function (...args: any[]) {
-  const client = (this as any).client;
-  if (client && !client.__patchedLog) {
-    const origLog = client.Log.bind(client);
-    client.Log = function (...logArgs: any[]) {
-      const stream = origLog(...logArgs);
-      stream.on("error", () => {});
-      stream.on("end", () => {});
-      return stream;
-    };
-    client.__patchedLog = true;
-  }
-  return _origExecute.apply(this, args);
-};
+import { adapterConfig } from "../index.ts";
 
 let mockServer: ReturnType<typeof Bun.serve>;
 let mockPort: number;
@@ -91,7 +60,7 @@ describe("openai adapter", () => {
   });
 
   it("opens a session and finalizes an outcome", async () => {
-    host = new TestHost({ binary: BINARY });
+    host = new TestHost({ config: adapterConfig });
     await host.openSession({
       config: { model: "gpt-4o", max_turns: "3" },
       secrets: {
@@ -110,7 +79,7 @@ describe("openai adapter", () => {
   });
 
   it("rejects missing OPENAI_API_KEY", async () => {
-    host = new TestHost({ binary: BINARY });
+    host = new TestHost({ config: adapterConfig });
     await expect(
       host.openSession({
         config: {},
@@ -120,7 +89,7 @@ describe("openai adapter", () => {
   });
 
   it("serializes and restores session state", async () => {
-    host = new TestHost({ binary: BINARY });
+    host = new TestHost({ config: adapterConfig });
     await host.openSession({
       config: { model: "gpt-4o" },
       secrets: { OPENAI_API_KEY: "sk-test-key" },
@@ -132,7 +101,7 @@ describe("openai adapter", () => {
     expect(snapshot.state.length).toBeGreaterThan(0);
 
     // Restore into a fresh session
-    const host2 = new TestHost({ binary: BINARY });
+    const host2 = new TestHost({ config: adapterConfig });
     try {
       await host2.openSession({
         config: {},
