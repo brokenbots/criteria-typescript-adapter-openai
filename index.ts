@@ -235,7 +235,7 @@ serve({
     }
 
     // Add allowed-outcomes preamble to the prompt
-    const allowedOutcomes = req.allowed_outcomes ?? [];
+    const allowedOutcomes = req.allowedOutcomes ?? [];
     if (allowedOutcomes.length > 0) {
       const outcomeList = allowedOutcomes.join(", ");
       const preamble = `You must finalize the outcome for this step by calling the submit_outcome tool exactly once before ending the turn. The allowed outcomes are: ${outcomeList}. If you do not call the tool with a valid outcome, the step will fail.\n\n`;
@@ -371,7 +371,7 @@ serve({
     };
     return {
       state: new TextEncoder().encode(JSON.stringify(state)),
-      schema_version: 1,
+      schemaVersion: 1,
     };
   },
 
