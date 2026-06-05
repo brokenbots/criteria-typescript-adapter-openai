@@ -102,7 +102,7 @@ function parseSubmitOutcomeArgs(raw: string): SubmitOutcomeArgs {
 
 export const adapterConfig = {
   name: "openai",
-  version: "2.0.0",
+  version: "0.5.0",
   description: "OpenAI adapter for Criteria workflows.",
   source_url: "https://github.com/criteria-adapters/openai",
   capabilities: ["multi_turn", "structured_events", "tool_calling"],
