@@ -104,7 +104,7 @@ export const adapterConfig = {
   name: "openai",
   version: "0.5.0",
   description: "OpenAI adapter for Criteria workflows.",
-  source_url: "https://github.com/criteria-adapters/openai",
+  source_url: "https://github.com/brokenbots/criteria-typescript-adapter-openai",
   capabilities: ["multi_turn", "structured_events", "tool_calling"],
   platforms: ["linux/amd64", "linux/arm64", "darwin/arm64"],
 
